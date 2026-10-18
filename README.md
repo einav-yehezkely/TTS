@@ -1,0 +1,65 @@
+# Kokoro PDF Reader
+
+A Windows desktop app that reads English PDF books and papers aloud with Kokoro-82M, running locally.
+While it reads, it highlights the current line on the original PDF page.
+User instructions (Hebrew): [README_HE.md](README_HE.md). To start, double-click `Kokoro PDF Reader.bat`.
+
+## Stack and why
+
+| Part | Choice | Reason |
+|---|---|---|
+| UI | PySide6 6.12 (Qt) `QGraphicsView` | Maintained. Scene units are PDF points, so overlays stay exact under any zoom, resize or scroll. |
+| PDF | PyMuPDF 1.28 | Fast rendering plus line, span and bbox extraction. |
+| Speech | Kokoro-82M v1.0, [timestamped ONNX export](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped) | Outputs per-phoneme durations alongside the audio. These drive the line timing. |
+| G2P | kokoro-onnx 0.6.1 tokenizer + espeak-ng (bundled) | Same phonemization Kokoro-ONNX uses. Works offline. |
+| Runtime | onnxruntime-gpu **1.26.0** + nvidia-*-cu12 wheels (CUDA 12.9 runtime, cuDNN 9.27) | ORT ≥ 1.27 wheels are built for CUDA 13, which needs driver ≥ 580. This machine has driver 577.05 (CUDA ≤ 12.9). 1.26.0 is the newest ORT built for CUDA 12.8. Its DLLs live in the venv, so there is no system CUDA install and no driver change. |
+| Audio | sounddevice (PortAudio), soundfile (FLAC cache, WAV), lameenc (MP3) | |
+| Env | uv, Python 3.12 installed under `.runtime/`, pinned `uv.lock` | Project-local. |
+
+Verified on: RTX 5050 Laptop GPU (Blackwell, compute capability 12.0, 8 GB), driver 577.05, Windows 11.
+
+## How highlighting is synchronized
+
+1. **Extraction** (`layout.py`) keeps every visual line with its page and bbox. Reading order comes from gutter detection. Full-width lines split the page into horizontal bands, and each band is read left column, then right column.
+2. **Segmentation** (`segments.py`) builds sentences out of *fragments*, each tied to one line id. De-hyphenation moves the continuation to the line where the word starts. Citation removal and abbreviation expansion happen inside fragments, or on the joined text with offset remapping, so the line mapping always survives cleanup.
+3. **Synthesis** (`engine.py`) phonemizes each fragment separately in a single espeak call, joins the tokens, runs the model once per sentence, and uses the returned per-token durations to find the sample where each line starts.
+4. **Playback** (`player.py`) maps the device frame being *heard* (from PortAudio DAC timestamps, or the stream latency when those are missing) back to (sentence, sample), and from there to a line. Pauses, underruns, seeks and page transitions all go through this one mapping.
+
+**Accuracy.** Line boundaries come from the model's own duration predictions, which are the durations the decoder uses to generate the audio. They are accurate to roughly one 25 ms frame. The on-screen change happens within about 0.1 s of the sound (30 ms UI poll plus the output-latency estimate). In testing, a line change was observed 115 ms after its data time, which matches the measured ~90 ms device latency. There is no word-level highlighting.
+
+## GPU verification and fallback
+
+At startup the first inference runs with ONNX Runtime profiling enabled. The app counts per-node kernel time by provider and requires at least half of it to be on CUDA (measured: 89–94%). CPU fallback is disabled inside ORT (`disable_fallback`), so failures surface instead of silently running on the CPU. Then:
+* If GPU initialization fails, the app uses the CPU and explains why in a dialog and in the status bar.
+* If a GPU run fails later, the app switches to the CPU and retries that sentence.
+
+One real case this caught: cuDNN 9 loads its sub-libraries (for example `cudnn_engines_tensor_ir64_9.dll`) through the normal DLL search path. Without the venv's `nvidia/*/bin` folders on `PATH`, ORT silently fell back to CPU even though "CUDA was available". `gpu.prepare_cuda_dlls()` fixes this.
+
+## Tests (run with `.venv\Scripts\python.exe`)
+
+| Script | Checks |
+|---|---|
+| `tests/unit_checks.py` | Known-answer layout tests (header, footer, page numbers, footnote, hyphenation, two columns, references). Scanned-PDF detection. Edits keep the mapping. Runtime GPU→CPU fallback. Cancellation. Runs with **network sockets blocked**. |
+| `tests/pipeline_check.py` | Real audio: play, pause, resume, next/previous, speed change, stop. Line-change timing compared against the model's timing. |
+| `tests/gui_check.py [pdf]` | Real window: click-to-read, ink-based highlight placement at 70/100/160/250% zoom and after resize, line-to-line movement, automatic page change, follow on/off, pause, edit mode, WAV and MP3 export. |
+| `tests/gui_fallback_check.py` | Whole app on CPU (simulated GPU failure), the explanation shown, position restored after reopening, OCR-required message. |
+| `tests/longdoc_check.py [pdf] [s]` | 244-page book from page 196: time to first audio, bounded prefetch, underruns, memory, stop. `KOKORO_FORCE_CPU=1` runs it on the CPU. |
+| `tests/download_check.py`, `tests/setup_dialog_check.py` | Resumable downloads and the first-run download dialog. |
+
+Developer tools: `tools/dump_layout.py`, `tools/dump_segments.py`.
+
+Environment switches: `KOKORO_FORCE_CPU=1` and `KOKORO_SIMULATE_GPU_FAILURE=1`.
+
+## Folders
+
+* `models/`: model and voices, downloaded once.
+* `data/`: settings, per-document state (position, edits), extraction cache, audio cache, logs.
+* `.venv/` and `.runtime/`: the private environment, created by `launcher/setup.ps1`.
+
+## Known limitations
+
+* Layout roles (headers, footnotes, references, equations, figure text, captions) are heuristics. Equations, tables and diagrams are not interpreted. Lines full of symbols are skipped by default, and Edit reading order lets you exclude regions by hand.
+* De-hyphenation drops every line-end hyphen that is followed by a lowercase letter, so a real compound split at its hyphen ("high-/level") is read as one word.
+* No OCR: scanned PDFs are detected and reported but can't be read.
+* Pausing drops the audio buffered in the device and resumes from the exact sample that was heard. The first ~0.1 s after Play is latency.
+* The process uses about 1.3–1.4 GB of RAM on the GPU path (CUDA and cuDNN libraries). This grows by a few tens of MB as ONNX Runtime caches new input shapes, then levels off.

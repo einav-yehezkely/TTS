@@ -1,0 +1,31 @@
+[project]
+name = "pdf-reader-kokoro"
+version = "0.1.0"
+description = "Local PDF read-aloud desktop app using Kokoro-82M with in-PDF line highlighting"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # GUI + PDF rendering
+    "PySide6-Essentials==6.12.0",
+    "PyMuPDF==1.28.2",
+    # Speech: ORT 1.26.0 is the last PyPI build against CUDA 12.8 (1.27+ needs CUDA 13 / driver >= 580).
+    "onnxruntime-gpu==1.26.0",
+    "kokoro-onnx==0.6.1",
+    # Project-local CUDA 12 / cuDNN 9 runtime DLLs (no system-wide CUDA install needed)
+    "nvidia-cuda-runtime-cu12==12.9.79",
+    "nvidia-cuda-nvrtc-cu12==12.9.86",
+    "nvidia-cublas-cu12==12.9.2.10",
+    "nvidia-cufft-cu12==11.4.1.4",
+    "nvidia-curand-cu12==10.3.10.19",
+    "nvidia-cudnn-cu12==9.27.0.42",
+    # Audio
+    "numpy==2.4.4",
+    "sounddevice==0.5.6",
+    "soundfile==0.14.0",
+    "lameenc==1.9.0",
+]
+
+[tool.uv]
+package = false
+# kokoro-onnx depends on the CPU "onnxruntime" wheel, which would clash with
+# onnxruntime-gpu (both install the same `onnxruntime` module). Drop it.
+override-dependencies = ["onnxruntime; sys_platform == 'never'"]

@@ -48,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))
 
+    from .ui import theme
+    settings = Settings.load()
+    theme.apply(app, settings.theme)
+
     if assets.missing_assets():
         from .ui.dialogs import SetupDialog
         if not SetupDialog().exec() or assets.missing_assets():
@@ -57,7 +61,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     from .ui.main_window import MainWindow
-    settings = Settings.load()
     win = MainWindow(settings)
     win.show()
     pdfs = [a for a in argv[1:] if a.lower().endswith(".pdf")]

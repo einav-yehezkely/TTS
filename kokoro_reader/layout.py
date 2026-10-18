@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pymupdf
 
-EXTRACTOR_VERSION = 5
+EXTRACTOR_VERSION = 6
 
 ROLES_NEVER_LAYOUT = {"margin", "header", "footer", "pagenum"}
 ROLE_LABELS = {
@@ -168,6 +168,10 @@ def _raw_page_lines(page: pymupdf.Page, page_no: int, first_id: int) -> list[Lin
             for i, s in enumerate(spans):
                 t = s["text"]
                 if _span_is_super(s, size) and re.fullmatch(r"[\s\d,*†‡§¶∗⋆\-–a-z]{1,8}", t):
+                    before = "".join(text_parts).rstrip()
+                    if before[-1:].isdigit() and t.strip().isdigit():
+                        text_parts.append(f" to the power of {t.strip()} ")  # exponent: 10⁴
+                        continue
                     if i == 0 and t.strip():
                         sup_start = True
                     continue  # footnote markers and other superscripts are not spoken
@@ -181,6 +185,15 @@ def _raw_page_lines(page: pymupdf.Page, page_no: int, first_id: int) -> list[Lin
                 > 0.6 * sum(len(s["text"]) for s in spans)
             dx, dy = ln.get("dir", (1, 0))
             bbox = pymupdf.Rect(ln["bbox"])
+            if abs(dy) <= 0.2 and dx >= 0.8:
+                # height from the baselines and sizes of the main-size spans: a glyph from a math font with a
+                # huge ascender or descender (×, ∑) would otherwise make the box cover the neighbouring lines
+                main = [s for s in spans if 0.8 * size <= s["size"] <= 1.25 * size and "origin" in s]
+                if main:
+                    top = min(s["origin"][1] - 0.80 * s["size"] for s in main)
+                    bottom = max(s["origin"][1] + 0.24 * s["size"] for s in main)
+                    if bottom - top < bbox.height:
+                        bbox = pymupdf.Rect(bbox.x0, max(bbox.y0, top), bbox.x1, min(bbox.y1, bottom))
             if rot is not None:
                 bbox = (bbox * rot).normalize()
             role = "margin" if (abs(dy) > 0.2 or dx < 0.8) else "body"

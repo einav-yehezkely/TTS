@@ -1,15 +1,16 @@
-"""Main window: PDF viewer in the center, playback toolbar, reading-order editor."""
+"""Main window: transcript panel, PDF viewer, player bar and reading-order editor."""
 
+import html
 import logging
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QKeySequence
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressDialog, QPushButton,
-                               QSlider, QStyle, QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
+from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton,
+                               QSizePolicy, QSlider, QToolBar, QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 from .. import assets
 from ..audiocache import AudioCache
@@ -20,13 +21,26 @@ from ..layout import ROLE_LABELS, DocLayout, load_or_extract
 from ..narrator import Narrator
 from ..paths import CACHE_DIR, EXTRACT_CACHE_DIR, VOICES_DIR
 from ..segments import build_segments, line_included, page_blocks, page_order
+from . import icons, theme
 from .dialogs import Bridge, ExportDialog, HelpDialog, OptionsDialog, info, open_folder
+from .transcript import Rail, SideSplitter, TranscriptPanel
 from .viewer import PdfView
+from .widgets import PlayButton, Scrubber, Toast, fraction_to_index
 
 log = logging.getLogger(__name__)
 
 STATE_TEXT = {"stopped": "Stopped", "playing": "Playing", "paused": "Paused",
               "buffering": "Preparing speech…"}
+SPEEDS = (0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
+
+
+def _fmt_duration(seconds: float) -> str:
+    m = int(round(seconds / 60))
+    if m < 1:
+        return "<1 min"
+    if m < 60:
+        return f"{m} min"
+    return f"{m // 60} h {m % 60:02d} min"
 
 
 class MainWindow(QMainWindow):
@@ -34,7 +48,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings
         self.setWindowTitle("Kokoro PDF Reader")
-        self.resize(1200, 900)
+        self.resize(1320, 920)
         self.engine: KokoroEngine | None = None
         self.narrator: Narrator | None = None
         self.cache: AudioCache | None = None
@@ -42,165 +56,318 @@ class MainWindow(QMainWindow):
         self.state: DocState | None = None
         self.segments = []
         self.reading_order: list[int] = []
+        self._cum: list[int] = [0]
         self._state_dirty = False
         self._export_token: CancelToken | None = None
         self._selected_block: int | None = None
         self._edit_page = 0
+        self._sleep_deadline: float | None = None
+        self._sleep_page: int | None = None
+        self._icon_targets: list[tuple[object, str, str]] = []
         self._bridge = Bridge()
+        theme.apply(QApplication.instance(), settings.theme)
 
         self.view = PdfView(self)
-        self.setCentralWidget(self._central())
         self._build_actions()
-        self._build_toolbar()
-        self._build_menu()
-        self._build_status()
+        self._build_topbar()
+        self.setCentralWidget(self._build_central())
         self._build_edit_dock()
+        self.statusBar().hide()  # messages appear as toasts; the status bar keeps them for tests and logs
         self.view.lineClicked.connect(self._on_page_click)
         self.view.regionSelected.connect(self._on_region)
         self.view.currentPageChanged.connect(self._on_page_changed)
         self.view.zoomChanged.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f}%"))
+        self.view.set_spotlight(settings.spotlight)
         if settings.zoom:
             self.view.set_zoom(settings.zoom)
+        if not settings.transcript_open:
+            self.splitter.set_collapsed(True, animate=False)
         self._save_timer = QTimer(self, interval=3000, timeout=self._save_state)
         self._save_timer.start()
+        self._clock = QTimer(self, interval=1000, timeout=self._tick_clock)
+        self._clock.start()
+        self._apply_icons()
         self._set_controls_enabled(False)
         self._start_engine()
 
-    # ---- layout ------------------------------------------------------------------------------------------
-    def _central(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        self.now_reading = QLabel("Open a PDF to start (File → Open, or Ctrl+O).")
-        self.now_reading.setStyleSheet("QLabel{background:#fff8e1;color:#333;padding:5px 10px;border-bottom:1px solid #e0c97a;}")
-        self.now_reading.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.banner = QLabel("")
-        self.banner.setWordWrap(True)
-        self.banner.setStyleSheet("QLabel{background:#fdecea;color:#611a15;padding:6px 10px;font-weight:bold;}")
-        self.banner.hide()
-        lay.addWidget(self.banner)
-        lay.addWidget(self.now_reading)
-        lay.addWidget(self.view, 1)
-        return w
-
-    def _icon(self, sp):
-        return self.style().standardIcon(sp)
+    # ---- actions -----------------------------------------------------------------------------------------
+    def _act(self, text, icon=None, shortcut=None, slot=None, checkable=False, tip=None) -> QAction:
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        if slot:
+            a.triggered.connect(slot)
+        a.setCheckable(checkable)
+        a.setToolTip(tip or (f"{text} ({QKeySequence(shortcut).toString()})" if shortcut else text))
+        if icon:
+            self._icon_targets.append((a, icon, "text"))
+        self.addAction(a)
+        return a
 
     def _build_actions(self) -> None:
-        S = QStyle.StandardPixmap
-        self.act_open = QAction(self._icon(S.SP_DialogOpenButton), "Open PDF…", self,
-                                shortcut=QKeySequence(QKeySequence.StandardKey.Open), triggered=self.choose_pdf)
-        self.act_play = QAction(self._icon(S.SP_MediaPlay), "Play", self, shortcut="Space", triggered=self._play_pause)
-        self.act_play.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        self.act_stop = QAction(self._icon(S.SP_MediaStop), "Stop", self, shortcut="Esc",
-                                triggered=lambda: self.narrator and self.narrator.stop())
-        self.act_prev = QAction(self._icon(S.SP_MediaSkipBackward), "Previous sentence", self, shortcut="Ctrl+Left",
-                                triggered=lambda: self.narrator and self.narrator.prev_sentence())
-        self.act_next = QAction(self._icon(S.SP_MediaSkipForward), "Next sentence", self, shortcut="Ctrl+Right",
-                                triggered=lambda: self.narrator and self.narrator.next_sentence())
-        self.act_goto = QAction("Go to reading position", self, shortcut="Ctrl+G", triggered=self._goto_current)
-        self.act_zoom_in = QAction("Zoom in", self, shortcut="Ctrl+=", triggered=lambda: self.view.zoom_by(1.2))
-        self.act_zoom_out = QAction("Zoom out", self, shortcut="Ctrl+-", triggered=lambda: self.view.zoom_by(1 / 1.2))
-        self.act_fit = QAction("Fit width", self, shortcut="Ctrl+0", triggered=self.view.set_fit_width)
-        self.act_edit = QAction("Edit reading order", self, checkable=True, triggered=self._toggle_edit)
-        self.act_export = QAction("Export audio…", self, shortcut="Ctrl+E", triggered=self._export)
-        self.act_options = QAction("Narration options…", self, triggered=self._options)
-        for a in (self.act_open, self.act_play, self.act_stop, self.act_prev, self.act_next, self.act_goto,
-                  self.act_zoom_in, self.act_zoom_out, self.act_fit, self.act_export):
-            self.addAction(a)
+        self.act_open = self._act("Open", "open", QKeySequence.StandardKey.Open, self.choose_pdf, tip="Open a PDF (Ctrl+O)")
+        self.act_play = self._act("Play", "play", "Space", self._play_pause)
+        self.act_stop = self._act("Stop", "stop", "Esc", lambda: self.narrator and self.narrator.stop())
+        self.act_prev = self._act("Previous sentence", "prev", "Ctrl+Left",
+                                  lambda: self.narrator and self.narrator.prev_sentence())
+        self.act_next = self._act("Next sentence", "next", "Ctrl+Right",
+                                  lambda: self.narrator and self.narrator.next_sentence())
+        self.act_goto = self._act("Go to reading position", None, "Ctrl+G", self._goto_current)
+        self.act_zoom_in = self._act("Zoom in", "zoom_in", "Ctrl+=", lambda: self.view.zoom_by(1.2))
+        self.act_zoom_out = self._act("Zoom out", "zoom_out", "Ctrl+-", lambda: self.view.zoom_by(1 / 1.2))
+        self.act_fit = self._act("Fit width", "fit", "Ctrl+0", self.view.set_fit_width)
+        self.act_transcript = self._act("Transcript", "transcript", "Ctrl+T", self._toggle_transcript, checkable=True,
+                                        tip="Show or hide the transcript (Ctrl+T)")
+        self.act_transcript.setChecked(self.settings.transcript_open)
+        self.act_focus = self._act("Focus", "focus", "F", self._toggle_focus, checkable=True,
+                                   tip="Focus mode: dim everything except the line being read (F)")
+        self.act_focus.setChecked(self.settings.spotlight)
+        self.act_edit = self._act("Reading order", "edit", None, self._toggle_edit, checkable=True,
+                                  tip="Check and correct the reading order, or exclude parts of a page")
+        self.act_export = self._act("Export", "export", "Ctrl+E", self._export, tip="Save as WAV or MP3 (Ctrl+E)")
+        self.act_options = self._act("Narration options…", None, None, self._options)
+        self.act_theme = self._act("Theme", "sun", "Ctrl+Shift+L", self._toggle_theme,
+                                   tip="Switch between dark and light (Ctrl+Shift+L)")
+        self.act_search = self._act("Search transcript", None, "Ctrl+F", self._focus_search)
 
-    def _build_toolbar(self) -> None:
+    # ---- top bar ----------------------------------------------------------------------------------------------
+    def _build_topbar(self) -> None:
         tb = QToolBar("Main", self)
+        tb.setObjectName("TopBar")
         tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tb.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.addToolBar(tb)
         tb.addAction(self.act_open)
-        tb.addSeparator()
-        tb.addAction(self.act_play)
-        tb.addAction(self.act_stop)
-        tb.addAction(self.act_prev)
-        tb.addAction(self.act_next)
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Voice "))
-        self.voice_box = QComboBox()
-        for v in assets.installed_voices() or [assets.DEFAULT_VOICE]:
-            self.voice_box.addItem(assets.VOICES.get(v, v), v)
-        idx = self.voice_box.findData(self.settings.voice)
-        self.voice_box.setCurrentIndex(max(0, idx))
-        self.voice_box.currentIndexChanged.connect(self._voice_changed)
-        self.voice_box.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        tb.addWidget(self.voice_box)
-        tb.addWidget(QLabel("  Speed "))
-        self.speed = QSlider(Qt.Orientation.Horizontal)
-        self.speed.setRange(50, 200)
-        self.speed.setSingleStep(5)
-        self.speed.setPageStep(10)
-        self.speed.setFixedWidth(130)
-        self.speed.setValue(int(round(self.settings.speed * 100)))
-        self.speed.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.speed_label = QLabel(f"{self.settings.speed:.2f}×")
-        self.speed_label.setMinimumWidth(42)
-        self.speed.valueChanged.connect(lambda v: self.speed_label.setText(f"{v / 100:.2f}×"))
-        self.speed.sliderReleased.connect(self._speed_changed)
-        self.speed.valueChanged.connect(lambda _: None if self.speed.isSliderDown() else self._speed_timer.start())
-        self._speed_timer = QTimer(self, singleShot=True, interval=350, timeout=self._speed_changed)
-        tb.addWidget(self.speed)
-        tb.addWidget(self.speed_label)
-        tb.addSeparator()
-        self.follow = QCheckBox("Follow reading")
-        self.follow.setToolTip("Scroll and turn pages automatically to keep the line being read visible.\n"
-                               "Turn off to browse other pages while listening.")
-        self.follow.setChecked(self.settings.follow)
-        self.follow.toggled.connect(self._follow_toggled)
-        self.follow.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        tb.addWidget(self.follow)
-        tb.addAction(self.act_goto)
-        tb.addSeparator()
-        tb.addAction(self.act_zoom_out)
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setMinimumWidth(44)
+        title_box = QWidget()
+        tl = QVBoxLayout(title_box)
+        tl.setContentsMargins(12, 0, 12, 0)
+        tl.setSpacing(0)
+        self.doc_title = QLabel("No document open", objectName="DocTitle")
+        self.doc_sub = QLabel("Open a PDF to start reading", objectName="DocSub")
+        tl.addWidget(self.doc_title)
+        tl.addWidget(self.doc_sub)
+        tb.addWidget(title_box)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        for a in (self.act_zoom_out,):
+            tb.addAction(a)
+        self.zoom_label = QLabel("100%", objectName="ZoomLabel")
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tb.addWidget(self.zoom_label)
         tb.addAction(self.act_zoom_in)
         tb.addAction(self.act_fit)
         tb.addSeparator()
-        tb.addAction(self.act_edit)
-        tb.addAction(self.act_export)
+        for a in (self.act_transcript, self.act_focus, self.act_edit, self.act_export):
+            tb.addAction(a)
+        for a in (self.act_zoom_out, self.act_zoom_in, self.act_fit):
+            btn = tb.widgetForAction(a)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        tb.addSeparator()
+        tb.addAction(self.act_theme)
+        tb.widgetForAction(self.act_theme).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.device_label = QLabel("Starting…", objectName="Badge")
+        self.device_label.setToolTip("The speech engine is starting")
+        tb.addWidget(self.device_label)
+        self.menu_btn = QToolButton(toolTip="More")
+        self.menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_btn.setText("⋯")
+        self.menu_btn.setStyleSheet("font-size: 16pt; padding: 0 8px;")
+        self.menu_btn.setMenu(self._build_menu())
+        tb.addWidget(self.menu_btn)
+        self._set_badge("Starting…", "muted")
 
-    def _build_menu(self) -> None:
-        m = self.menuBar()
-        f = m.addMenu("&File")
-        f.addAction(self.act_open)
-        self.recent_menu = f.addMenu("Open recent")
+    def _build_menu(self) -> QMenu:
+        m = QMenu(self)
+        m.addAction(self.act_open)
+        self.recent_menu = m.addMenu("Open recent")
         self._refresh_recent()
-        f.addSeparator()
-        f.addAction(self.act_export)
-        f.addSeparator()
-        f.addAction(QAction("Exit", self, triggered=self.close))
-        p = m.addMenu("&Playback")
+        m.addAction(self.act_export)
+        m.addSeparator()
         for a in (self.act_play, self.act_stop, self.act_prev, self.act_next, self.act_goto):
-            p.addAction(a)
-        v = m.addMenu("&View")
-        for a in (self.act_zoom_in, self.act_zoom_out, self.act_fit):
-            v.addAction(a)
-        t = m.addMenu("&Tools")
-        t.addAction(self.act_edit)
-        t.addAction(self.act_options)
-        h = m.addMenu("&Help")
-        h.addAction(QAction("הוראות שימוש (Hebrew instructions)", self, triggered=lambda: HelpDialog(self).exec()))
-        h.addAction(QAction("Speech device details", self, triggered=self._device_details))
+            m.addAction(a)
+        m.addSeparator()
+        m.addAction(self.act_options)
+        m.addAction(self.act_edit)
+        m.addAction(self.act_search)
+        m.addSeparator()
+        m.addAction(QAction("הוראות שימוש (Hebrew instructions)", self, triggered=lambda: HelpDialog(self).exec()))
+        m.addAction(QAction("Speech device details", self, triggered=self._device_details))
+        m.addSeparator()
+        m.addAction(QAction("Exit", self, triggered=self.close))
+        return m
 
-    def _build_status(self) -> None:
-        sb = self.statusBar()
-        self.device_label = QLabel("Speech engine: starting…")
-        self.device_label.setStyleSheet("padding:0 8px;")
-        self.state_label = QLabel("")
-        self.page_label = QLabel("")
-        sb.addPermanentWidget(self.state_label)
-        sb.addPermanentWidget(self.page_label)
-        sb.addPermanentWidget(self.device_label)
+    def _set_badge(self, text: str, token: str) -> None:
+        c = theme.color(token)
+        bg = QColor(c)
+        bg.setAlpha(40)
+        self.device_label.setText(text)
+        self.device_label.setStyleSheet(
+            f"background: rgba({bg.red()},{bg.green()},{bg.blue()},{bg.alpha()}); color: {c.name()};")
+        self._badge_token = token
 
+    # ---- central area -----------------------------------------------------------------------------------------
+    def _build_central(self) -> QWidget:
+        central = QWidget(objectName="Central")
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.banner = QLabel("", objectName="Banner")
+        self.banner.setWordWrap(True)
+        self.banner.hide()
+        lay.addWidget(self.banner)
+
+        self.reading_area = QWidget()
+        ra = QVBoxLayout(self.reading_area)
+        ra.setContentsMargins(0, 0, 0, 0)
+        ra.addWidget(self.view)
+        self.toast = Toast(self.reading_area)
+
+        self.transcript = TranscriptPanel()
+        self.transcript.activated.connect(self._transcript_activated)
+        self.transcript.collapseRequested.connect(lambda: self._set_transcript(False))
+        self.rail = Rail()
+        self.rail.clicked.connect(lambda: self._set_transcript(True))
+        self.splitter = SideSplitter(self.transcript, self.rail, self.reading_area, self.settings.transcript_width)
+        lay.addWidget(self.splitter, 1)
+        lay.addWidget(self._build_player())
+        return central
+
+    def _build_player(self) -> QWidget:
+        bar = QWidget(objectName="PlayerBar")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(18, 10, 18, 12)
+        v.setSpacing(6)
+        top = QHBoxLayout()
+        self.caption = QLabel("", objectName="Caption")
+        self.caption.setWordWrap(True)
+        self.caption.setTextFormat(Qt.TextFormat.RichText)
+        self.caption.setMinimumHeight(22)
+        self.caption.setMaximumHeight(46)
+        self.caption.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.state_label = QLabel("", objectName="CaptionHint")
+        top.addWidget(self.caption, 1)
+        top.addWidget(self.state_label, 0, Qt.AlignmentFlag.AlignTop)
+        v.addLayout(top)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        def tbtn(action, size=20):
+            b = QToolButton()
+            b.setDefaultAction(action)
+            b.setIconSize(QSize(size, size))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            b.setAutoRaise(True)
+            return b
+        row.addWidget(tbtn(self.act_prev))
+        self.play_btn = PlayButton()
+        self.play_btn.clicked.connect(self._play_pause)
+        row.addWidget(self.play_btn)
+        row.addWidget(tbtn(self.act_next))
+        row.addWidget(tbtn(self.act_stop, 16))
+        row.addSpacing(8)
+        self.scrubber = Scrubber()
+        self.scrubber.seekRequested.connect(self._seek_fraction)
+        self.scrubber.describe = self._describe_fraction
+        row.addWidget(self.scrubber, 1)
+        self.page_label = QLabel("", objectName="Meta")
+        self.page_label.setMinimumWidth(150)
+        self.page_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.page_label)
+        row.addSpacing(8)
+
+        self.voice_box = QComboBox(objectName="Chip")
+        for vname in assets.installed_voices() or [assets.DEFAULT_VOICE]:
+            self.voice_box.addItem(assets.VOICES.get(vname, vname), vname)
+        self.voice_box.setCurrentIndex(max(0, self.voice_box.findData(self.settings.voice)))
+        self.voice_box.currentIndexChanged.connect(self._voice_changed)
+        self.voice_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.voice_box.setToolTip("Voice")
+        row.addWidget(self.voice_box)
+
+        self.speed_btn = QToolButton(objectName="Chip")
+        self.speed_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.speed_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.speed_btn.setToolTip("Reading speed")
+        self._icon_targets.append((self.speed_btn, "speed", "muted"))
+        menu = QMenu(self.speed_btn)
+        group = QActionGroup(menu)
+        self._speed_actions = {}
+        for s in SPEEDS:
+            a = menu.addAction(f"{s:.2f}×".replace(".00×", ".0×"))
+            a.setCheckable(True)
+            group.addAction(a)
+            a.triggered.connect(lambda _=False, s=s: self.speed.setValue(int(round(s * 100))))
+            self._speed_actions[s] = a
+        menu.addSeparator()
+        slider_box = QWidget()
+        sl = QHBoxLayout(slider_box)
+        sl.setContentsMargins(12, 4, 12, 6)
+        self.speed = QSlider(Qt.Orientation.Horizontal)
+        self.speed.setRange(50, 200)
+        self.speed.setSingleStep(5)
+        self.speed.setPageStep(10)
+        self.speed.setFixedWidth(170)
+        self.speed.setValue(int(round(self.settings.speed * 100)))
+        sl.addWidget(QLabel("0.5×"))
+        sl.addWidget(self.speed)
+        sl.addWidget(QLabel("2×"))
+        wa = QWidgetAction(menu)
+        wa.setDefaultWidget(slider_box)
+        menu.addAction(wa)
+        self.speed_btn.setMenu(menu)
+        self.speed.valueChanged.connect(self._speed_display)
+        self.speed.valueChanged.connect(lambda _: None if self.speed.isSliderDown() else self._speed_timer.start())
+        self.speed.sliderReleased.connect(self._speed_changed)
+        self._speed_timer = QTimer(self, singleShot=True, interval=350, timeout=self._speed_changed)
+        self._speed_display(self.speed.value())
+        row.addWidget(self.speed_btn)
+
+        self.sleep_btn = QToolButton(objectName="Chip")
+        self.sleep_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.sleep_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.sleep_btn.setText("Sleep")
+        self.sleep_btn.setToolTip("Sleep timer: pause reading automatically")
+        self._icon_targets.append((self.sleep_btn, "timer", "muted"))
+        sm = QMenu(self.sleep_btn)
+        sm.addAction("Off", lambda: self._set_sleep(None))
+        for mins in (5, 15, 30, 45, 60, 90):
+            sm.addAction(f"In {mins} minutes", lambda m=mins: self._set_sleep(m * 60))
+        sm.addAction("At the end of this page", lambda: self._set_sleep("page"))
+        self.sleep_btn.setMenu(sm)
+        row.addWidget(self.sleep_btn)
+
+        self.follow = QToolButton(objectName="Chip")
+        self.follow.setCheckable(True)
+        self.follow.setText("Follow")
+        self.follow.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.follow.setToolTip("Scroll and turn pages automatically to keep the line being read visible.\n"
+                               "Turn off to browse other pages while listening.")
+        self.follow.setChecked(self.settings.follow)
+        self.follow.toggled.connect(self._follow_toggled)
+        self.follow.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._icon_targets.append((self.follow, "follow", "muted"))
+        row.addWidget(self.follow)
+        v.addLayout(row)
+        self._set_caption(None)
+        return bar
+
+    def _apply_icons(self) -> None:
+        for target, name, token in self._icon_targets:
+            target.setIcon(icons.icon(name, token))
+        if self.narrator and self.narrator.state in ("playing", "buffering"):
+            self.act_play.setIcon(icons.icon("pause"))
+        self.act_theme.setIcon(icons.icon("sun" if theme.current_name == "dark" else "moon"))
+        self.voice_box.setIconSize(QSize(16, 16))
+        for i in range(self.voice_box.count()):
+            self.voice_box.setItemIcon(i, icons.icon("voice", "muted"))
+
+    # ---- edit dock --------------------------------------------------------------------------------------------
     def _build_edit_dock(self) -> None:
         dock = QDockWidget("Reading order", self)
         dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea)
@@ -236,9 +403,9 @@ class MainWindow(QMainWindow):
         reset.clicked.connect(self._reset_page)
         lay.addWidget(reset)
         hint = QLabel("Numbers on the page show the reading order of text blocks.<br>"
-                      "<span style='color:#1b5e20'>Green</span>: read aloud. "
-                      "<span style='color:#b71c1c'>Red</span>: excluded by you. "
-                      "<span style='color:#616161'>Grey</span>: skipped automatically "
+                      "<span style='color:#43a047'>Green</span>: read aloud. "
+                      "<span style='color:#e53935'>Red</span>: excluded by you. "
+                      "<span style='color:#9e9e9e'>Grey</span>: skipped automatically "
                       "(headers, page numbers, footnotes, references, equations, figure text — see Narration options)."
                       "<br><br><b>Click</b> a block to select it. <b>Drag a rectangle</b> on the page to exclude "
                       "(or restore) everything inside it, for example a table or an equation.")
@@ -250,13 +417,23 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.edit_dock = dock
 
+    # ---- notifications ----------------------------------------------------------------------------------------
+    def notify(self, text: str, ms: int = 5000) -> None:
+        self.toast.show_message(text, ms)
+        self.statusBar().showMessage(text, ms)
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        if self.toast.isVisible():
+            self.toast.move((self.reading_area.width() - self.toast.width()) // 2, 18)
+
     # ---- engine startup ---------------------------------------------------------------------------------------
     def _start_engine(self) -> None:
         bridge = self._bridge
         bridge.done.connect(self._engine_ready)
         bridge.failed.connect(self._engine_failed)
         prefer = self.settings.prefer_gpu
-        self.device_label.setText("Speech engine: starting (checking the GPU)…")
+        self._set_badge("Checking GPU…", "muted")
 
         def work():
             try:
@@ -274,9 +451,11 @@ class MainWindow(QMainWindow):
         self.narrator.voice = self.voice_box.currentData()
         self.narrator.speed = self.speed.value() / 100
         self.narrator.lineChanged.connect(self._on_line)
+        # a new sentence can start on the line the previous one ended on: no line change, but a new sentence
+        self.narrator.segmentChanged.connect(lambda _: self._show_line(self.narrator.current_line, False))
         self.narrator.stateChanged.connect(self._on_state)
-        self.narrator.message.connect(lambda m: self.statusBar().showMessage(m, 6000))
-        self.narrator.error.connect(lambda m: self.statusBar().showMessage(m, 10000))
+        self.narrator.message.connect(lambda m: self.notify(m, 6000))
+        self.narrator.error.connect(lambda m: self.notify(m, 10000))
         dev_bridge = Bridge()
         dev_bridge.done.connect(lambda _: self._device_changed())
         self._dev_bridge = dev_bridge
@@ -292,7 +471,7 @@ class MainWindow(QMainWindow):
                  engine.fallback_reason)
 
     def _engine_failed(self, msg: str) -> None:
-        self.device_label.setText("Speech engine: failed")
+        self._set_badge("Speech unavailable", "bad")
         QMessageBox.critical(self, "Speech engine could not start",
                              "The speech engine could not start, so documents can be viewed but not read aloud.\n\n"
                              f"Details: {msg}")
@@ -305,11 +484,10 @@ class MainWindow(QMainWindow):
     def _update_device_label(self) -> None:
         e = self.engine
         if e.device == "cuda":
-            self.device_label.setText(f"Speech device: GPU ({e.gpu.name}) ✓")
-            self.device_label.setStyleSheet("padding:0 8px;color:#1b5e20;font-weight:bold;")
+            name = e.gpu.name.replace("NVIDIA ", "").replace("GeForce ", "")
+            self._set_badge(f"GPU · {name} ✓", "good")
         else:
-            self.device_label.setText("Speech device: CPU")
-            self.device_label.setStyleSheet("padding:0 8px;color:#e65100;font-weight:bold;")
+            self._set_badge("CPU", "warn")
         self.device_label.setToolTip(e.device_details())
 
     def _device_details(self) -> None:
@@ -382,6 +560,7 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self._refresh_recent()
         self.setWindowTitle(f"{Path(path).name} — Kokoro PDF Reader")
+        self.doc_title.setText(Path(path).stem)
         self.view.load(path, [(p.width, p.height) for p in layout.pages])
         self._rebuild_segments()
         self._push_segments(initial=True)
@@ -405,14 +584,28 @@ class MainWindow(QMainWindow):
             empty = [p.index + 1 for p in layout.pages if p.no_text]
             if empty:
                 shown = ", ".join(map(str, empty[:12])) + ("…" if len(empty) > 12 else "")
-                self.statusBar().showMessage(f"Pages without a text layer (skipped, OCR required): {shown}", 15000)
+                self.notify(f"Pages without a text layer (skipped, OCR required): {shown}", 12000)
         if not self.segments and not layout.scanned:
-            self.now_reading.setText("No readable text was found with the current narration options.")
+            self._set_caption(None, "No readable text was found with the current narration options.")
 
     def _rebuild_segments(self) -> None:
         lay, st = self.layout_, self.state
         self.segments = build_segments(lay, st, self.settings.options)
         self.reading_order = [lid for p in range(lay.page_count) for lid in page_order(lay, st, p)]
+        cum = [0]
+        for s in self.segments:
+            cum.append(cum[-1] + len(s.text) + 1)
+        self._cum = cum
+        ticks, last = [], None
+        for s in self.segments:
+            pg = lay.lines[s.first_line].page
+            if pg != last:
+                ticks.append(cum[s.index] / max(1, cum[-1]))
+                last = pg
+        self.scrubber.set_ticks(ticks)
+        self.transcript.set_document(self.segments, lay)
+        mins = _fmt_duration(cum[-1] / (14.5 * self.speed.value() / 100))
+        self.doc_sub.setText(f"{lay.page_count} pages · {len(self.segments):,} sentences · about {mins} of listening")
 
     def _push_segments(self, initial: bool = False) -> None:
         if not self.narrator or self.layout_ is None:
@@ -424,7 +617,7 @@ class MainWindow(QMainWindow):
                 self.narrator.seek_line(last)
                 self._show_line(self.narrator.current_line, force_scroll=True)
                 pg = self.layout_.lines[last].page + 1
-                self.statusBar().showMessage(f"Continuing from where you stopped (page {pg}). Press Play.", 8000)
+                self.notify(f"Continuing from where you stopped (page {pg}). Press Play.", 8000)
             elif self.segments:
                 self._show_line(self.segments[0].first_line, force_scroll=False)
         else:
@@ -436,6 +629,8 @@ class MainWindow(QMainWindow):
     def _set_controls_enabled(self, on: bool) -> None:
         for a in (self.act_play, self.act_stop, self.act_prev, self.act_next, self.act_export, self.act_goto):
             a.setEnabled(on)
+        self.play_btn.setEnabled(on)
+        self.scrubber.setEnabled(on)
 
     def _play_pause(self) -> None:
         if self.narrator and self.segments:
@@ -446,12 +641,20 @@ class MainWindow(QMainWindow):
         self.settings.voice = v
         if self.narrator:
             self.narrator.set_voice(v)
+        self.notify(f"Voice: {self.voice_box.currentText()}", 2500)
+
+    def _speed_display(self, v: int) -> None:
+        s = v / 100
+        self.speed_btn.setText(f"{s:.2f}×")
+        for val, a in self._speed_actions.items():
+            a.setChecked(abs(val - s) < 0.001)
 
     def _speed_changed(self) -> None:
         s = self.speed.value() / 100
         self.settings.speed = s
         if self.narrator:
             self.narrator.set_speed(s)
+        self._update_meta()
 
     def _follow_toggled(self, on: bool) -> None:
         self.settings.follow = on
@@ -461,19 +664,22 @@ class MainWindow(QMainWindow):
     def _goto_current(self) -> None:
         if self.narrator and self.narrator.current_line is not None:
             self._show_line(self.narrator.current_line, force_scroll=True)
+            self.transcript.resume_following()
 
     def _on_state(self, state: str) -> None:
-        S = QStyle.StandardPixmap
         playing = state in ("playing", "buffering")
         self.act_play.setText("Pause" if playing else ("Resume" if state == "paused" else "Play"))
-        self.act_play.setIcon(self._icon(S.SP_MediaPause if playing else S.SP_MediaPlay))
-        self.state_label.setText(STATE_TEXT.get(state, state))
+        self.act_play.setIcon(icons.icon("pause" if playing else "play"))
+        self.play_btn.set_mode("buffering" if state == "buffering" else ("pause" if playing else "play"))
+        self.state_label.setText(STATE_TEXT.get(state, state) if state != "playing" else "")
 
     def _on_line(self, lid: int) -> None:
         self._show_line(lid, force_scroll=False)
         if self.state is not None:
             self.state.last_line = lid
             self._state_dirty = True
+        if self._sleep_page is not None and self.layout_.lines[lid].page != self._sleep_page:
+            self._sleep_fire()
 
     def _show_line(self, lid: int | None, force_scroll: bool) -> None:
         if lid is None or self.layout_ is None:
@@ -481,22 +687,146 @@ class MainWindow(QMainWindow):
         line = self.layout_.lines[lid]
         self.view.set_highlight(line.page, [line.bbox])
         if force_scroll or self.follow.isChecked():
-            self.view.ensure_visible(line.page, line.bbox)
+            self.view.ensure_visible(line.page, line.bbox, animate=not force_scroll)
         if self.narrator and self.segments and 0 <= self.narrator.current_seg < len(self.segments):
-            text = self.segments[self.narrator.current_seg].text
-            fm = QFontMetrics(self.now_reading.font())
-            self.now_reading.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, max(200, self.width() - 40)))
-            self.now_reading.setToolTip(text)
+            self.transcript.set_position(self.narrator.current_seg, lid)
+            self._set_caption(self.narrator.current_seg, lid=lid)
+        self._update_meta()
+
+    def _set_caption(self, seg: int | None, hint: str = "", lid: int | None = None) -> None:
+        if seg is None:
+            text = hint or ("Click any line in the document — or any sentence in the transcript — to start reading "
+                            "from there." if self.layout_ else "Open a PDF to start reading.")
+            self.caption.setText(f"<span style='color:{theme.current['muted']}'>{html.escape(text)}</span>")
+            return
+        parts = []
+        mark = theme.color("mark_soft")
+        for flid, t in self.segments[seg].fragments:
+            t = html.escape(t)
+            if flid == lid:
+                parts.append(f"<span style='background-color:rgba({mark.red()},{mark.green()},{mark.blue()},"
+                             f"{mark.alpha()});'>{t}</span>")
+            else:
+                parts.append(t)
+        self.caption.setText(" ".join(parts))
+
+    def _update_meta(self) -> None:
+        if not (self.layout_ and self.segments and self.narrator):
+            self.page_label.setText("")
+            return
+        seg = max(0, min(self.narrator.current_seg, len(self.segments) - 1))
+        total = self._cum[-1]
+        frac = self._cum[seg] / max(1, total)
+        self.scrubber.set_value(frac)
+        rate = self.narrator.chars_per_second * self.narrator.speed
+        left = _fmt_duration((total - self._cum[seg]) / max(1.0, rate))
+        page = self.layout_.lines[self.segments[seg].first_line].page
+        self.page_label.setText(f"Page {page + 1}/{self.layout_.page_count}  ·  {frac * 100:.0f}%  ·  {left} left")
+
+    def _describe_fraction(self, f: float) -> str:
+        if not self.segments or not self.layout_:
+            return ""
+        seg = self.segments[fraction_to_index(self._cum, f)]
+        page = self.layout_.lines[seg.first_line].page + 1
+        text = seg.text if len(seg.text) < 90 else seg.text[:88] + "…"
+        return f"Page {page} of {self.layout_.page_count}  ·  {f * 100:.0f}%\n“{text}”"
+
+    def _seek_fraction(self, f: float) -> None:
+        if not (self.narrator and self.segments):
+            return
+        seg = fraction_to_index(self._cum, f)
+        if self.narrator.state in ("playing", "buffering"):
+            self.narrator.play(seg)
+        else:
+            self.narrator.seek_line(self.segments[seg].first_line)
+            self._show_line(self.segments[seg].first_line, force_scroll=True)
+        self.transcript.resume_following()
+
+    def _transcript_activated(self, seg: int, line: int) -> None:
+        if self.narrator:
+            self.narrator.play(seg, line)
+
+    def _tick_clock(self) -> None:
+        if self._sleep_deadline is not None:
+            left = self._sleep_deadline - time.monotonic()
+            if left <= 0:
+                self._sleep_fire()
+            else:
+                m, s = divmod(int(left), 60)
+                self.sleep_btn.setText(f"{m}:{s:02d}")
+
+    def _set_sleep(self, value) -> None:
+        self._sleep_deadline = None
+        self._sleep_page = None
+        if value is None:
+            self.sleep_btn.setText("Sleep")
+            self.notify("Sleep timer off", 2500)
+        elif value == "page":
+            if self.narrator and self.layout_ and self.narrator.current_line is not None:
+                self._sleep_page = self.layout_.lines[self.narrator.current_line].page
+                self.sleep_btn.setText("End of page")
+                self.notify(f"Reading will pause at the end of page {self._sleep_page + 1}", 3500)
+        else:
+            self._sleep_deadline = time.monotonic() + value
+            self.notify(f"Reading will pause in {value // 60} minutes", 3500)
+            self._tick_clock()
+
+    def _sleep_fire(self) -> None:
+        self._sleep_deadline = None
+        self._sleep_page = None
+        self.sleep_btn.setText("Sleep")
+        if self.narrator:
+            self.narrator.pause()
+        self.notify("Sleep timer: reading paused. Press Play to continue.", 8000)
+
+    # ---- panels and modes ------------------------------------------------------------------------------------------
+    def _toggle_transcript(self, on: bool) -> None:
+        self._set_transcript(on)
+
+    def _set_transcript(self, on: bool) -> None:
+        self.act_transcript.setChecked(on)
+        self.settings.transcript_open = on
+        self.splitter.set_collapsed(not on)
+
+    def _focus_search(self) -> None:
+        self._set_transcript(True)
+        self.transcript.focus_search()
+
+    def _toggle_focus(self, on: bool) -> None:
+        self.settings.spotlight = on
+        self.view.set_spotlight(on)
+        self.notify("Focus mode on: everything except the line being read is dimmed" if on else "Focus mode off",
+                    2500)
+
+    def _toggle_theme(self) -> None:
+        name = "light" if theme.current_name == "dark" else "dark"
+        theme.apply(QApplication.instance(), name)
+        self.settings.theme = name
+        self._apply_icons()
+        self.view.refresh_theme()
+        self.transcript.refresh_theme()
+        if self.layout_ is not None:
+            seg, line = (self.narrator.current_seg, self.narrator.current_line) if self.narrator else (None, None)
+            self.transcript.set_document(self.segments, self.layout_)
+            if line is not None:
+                self.transcript.set_position(seg, line)
+                self._set_caption(seg, lid=line)
+        else:
+            self._set_caption(None)
+        if self.engine:
+            self._update_device_label()
+        else:
+            self._set_badge(self.device_label.text(), self._badge_token)
+        self.rail.update()
+        self.play_btn.update()
+        self.scrubber.update()
+        if self.act_edit.isChecked():
+            self._refresh_edit()
 
     def _on_page_changed(self, page: int) -> None:
-        if self.layout_:
-            p = self.layout_.pages[page]
-            label = f" (printed {p.label})" if p.label and p.label != str(page + 1) else ""
-            extra = " — no text layer, OCR required" if p.no_text else ""
-            self.page_label.setText(f"Page {page + 1} of {self.layout_.page_count}{label}{extra}")
-            if self.act_edit.isChecked():
-                self._edit_page = page
-                self._refresh_edit()
+        if self.layout_ and self.act_edit.isChecked():
+            self._edit_page = page
+            self._refresh_edit()
 
     def _hit_line(self, page: int, x: float, y: float, prefer_narrated: bool = True) -> int | None:
         lay = self.layout_
@@ -526,9 +856,10 @@ class MainWindow(QMainWindow):
         if lid is None or not self.narrator:
             return
         if not line_included(self.layout_.lines[lid], self.state, self.settings.options):
-            self.statusBar().showMessage("That line is not read aloud (see Narration options or Edit reading "
-                                         "order). Starting from the next line that is.", 6000)
+            self.notify("That line is not read aloud (see Narration options or Reading order). Starting from the "
+                        "next line that is.", 6000)
         self.narrator.play_line(lid)
+        self.transcript.resume_following()
 
     # ---- reading order editing ------------------------------------------------------------------------------------
     def _toggle_edit(self, on: bool) -> None:
@@ -563,6 +894,7 @@ class MainWindow(QMainWindow):
         overlays = []
         self.block_list.blockSignals(True)
         self.block_list.clear()
+        accent = theme.color("accent")
         for k, b in enumerate(blocks):
             lines = by_block[b]
             for l in lines:
@@ -578,7 +910,7 @@ class MainWindow(QMainWindow):
             x1 = max(l.x1 for l in lines)
             y1 = max(l.y1 for l in lines)
             selected = b == self._selected_block
-            edge = QColor(25, 118, 210) if not selected else QColor(255, 111, 0)
+            edge = accent if not selected else QColor(255, 111, 0)
             overlays.append((page, (x0, y0, x1, y1), QColor(0, 0, 0, 0), edge, str(k + 1)))
             narrated = [l for l in lines if line_included(l, st, opts)]
             roles = {ROLE_LABELS.get(l.role, l.role) for l in lines}
@@ -587,7 +919,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{k + 1}. [{', '.join(sorted(roles))}; {status}] {text[:140]}")
             item.setData(Qt.ItemDataRole.UserRole, b)
             if not narrated:
-                item.setForeground(QColor(140, 140, 140))
+                item.setForeground(theme.color("muted"))
             self.block_list.addItem(item)
             if selected:
                 self.block_list.setCurrentItem(item)
@@ -682,7 +1014,7 @@ class MainWindow(QMainWindow):
                 self.cache.set_limit(self.settings.cache_limit_mb)
                 if dlg.clear_requested:
                     self.cache.clear()
-                    self.statusBar().showMessage("Audio cache cleared.", 5000)
+                    self.notify("Audio cache cleared.", 4000)
             if self.layout_ is not None:
                 self._rebuild_segments()
                 self._push_segments()
@@ -707,7 +1039,8 @@ class MainWindow(QMainWindow):
         voice, speed, path = self.narrator.voice, self.narrator.speed, dlg.path
         token = CancelToken()
         self._export_token = token
-        progress = QProgressDialog(f"Exporting {len(segs)} sentences to {Path(path).name}…", "Cancel", 0, len(segs), self)
+        progress = QProgressDialog(f"Exporting {len(segs)} sentences to {Path(path).name}…", "Cancel", 0, len(segs),
+                                   self)
         progress.setWindowTitle("Exporting audio")
         progress.setWindowModality(Qt.WindowModality.NonModal)
         progress.setMinimumDuration(0)
@@ -734,7 +1067,7 @@ class MainWindow(QMainWindow):
             if msg != "cancelled":
                 QMessageBox.warning(self, "Export failed", msg)
             else:
-                self.statusBar().showMessage("Export cancelled.", 5000)
+                self.notify("Export cancelled.", 4000)
         bridge.done.connect(done)
         bridge.failed.connect(failed)
         self._export_bridge = bridge
@@ -761,6 +1094,8 @@ class MainWindow(QMainWindow):
         self._state_dirty = True
         self._save_state()
         self.settings.zoom = 0.0 if self.view.fit_width else self.view.zoom
+        if not self.splitter.collapsed:
+            self.settings.transcript_width = self.splitter.sizes()[0]
         self.settings.save()
         if self._export_token:
             self._export_token.cancel()
@@ -768,7 +1103,3 @@ class MainWindow(QMainWindow):
             self.narrator.shutdown()
         self.view.close_document()
         super().closeEvent(event)
-
-
-def app_instance() -> QApplication:
-    return QApplication.instance()

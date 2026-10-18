@@ -9,10 +9,12 @@ only change the view transform, so overlays cannot drift from the text.
 import threading
 
 import pymupdf
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QTransform
-from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem,
-                               QGraphicsView, QRubberBand)
+from PySide6.QtCore import QEasingCurve, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap, QTransform
+from PySide6.QtWidgets import (QFrame, QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene,
+                               QGraphicsSimpleTextItem, QGraphicsView, QRubberBand)
+
+from . import theme
 
 PAGE_GAP = 14.0
 MARGIN = 10.0
@@ -71,7 +73,12 @@ class PdfView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
-        self.setBackgroundBrush(QColor("#5f6368"))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(theme.color("canvas"))
+        self.spotlight = False
+        self._spot: QGraphicsPathItem | None = None
+        self._scroll_anim = QVariantAnimation(self, duration=280, easingCurve=QEasingCurve.Type.OutCubic)
+        self._scroll_anim.valueChanged.connect(lambda v: self.verticalScrollBar().setValue(int(v)))
         self.setRenderHints(QPainter.RenderHint.SmoothPixmapTransform | QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -101,7 +108,7 @@ class PdfView(QGraphicsView):
         scene = self.scene()
         scene.clear()
         self._pages, self._sizes, self._offsets, self._scales = [], list(sizes), [], {}
-        self._hl_items, self._overlays = [], []
+        self._hl_items, self._overlays, self._spot = [], [], None
         max_w = max((w for w, _ in sizes), default=600)
         y = MARGIN
         for i, (w, h) in enumerate(sizes):
@@ -109,7 +116,7 @@ class PdfView(QGraphicsView):
             bg = QGraphicsRectItem(0, 0, w, h)
             bg.setPos(x, y)
             bg.setBrush(QBrush(Qt.GlobalColor.white))
-            bg.setPen(QPen(QColor("#3c4043"), 0))
+            bg.setPen(QPen(QColor(0, 0, 0, 60), 0))
             bg.setZValue(0)
             scene.addItem(bg)
             pix = QGraphicsPixmapItem(bg)
@@ -253,6 +260,39 @@ class PdfView(QGraphicsView):
             it.setZValue(10)
             self.scene().addItem(it)
             self._hl_items.append(it)
+        self._update_spotlight()
+
+    # ---- focus mode -------------------------------------------------------------------------------------------
+    def set_spotlight(self, on: bool) -> None:
+        self.spotlight = on
+        self._update_spotlight()
+
+    def _update_spotlight(self) -> None:
+        if not self.spotlight or not self._hl_items:
+            if self._spot is not None:
+                self._spot.hide()
+            return
+        if self._spot is None:
+            self._spot = QGraphicsPathItem()
+            self._spot.setPen(QPen(Qt.PenStyle.NoPen))
+            self._spot.setZValue(8)  # above the page bitmaps, below the highlight
+            self.scene().addItem(self._spot)
+        self._spot.setBrush(QColor(8, 10, 16, 165))
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        path.addRect(self.scene().sceneRect())
+        hole = self._hl_items[0].rect().adjusted(-10, -9, 10, 9)
+        path.addRoundedRect(hole, 6, 6)
+        self._spot.setPath(path)
+        self._spot.show()
+
+    def spotlight_rect_in_viewport(self) -> QRect | None:
+        if self._spot is None or not self._spot.isVisible():
+            return None
+        return self.mapFromScene(self._hl_items[0].rect()).boundingRect()
+
+    def refresh_theme(self) -> None:
+        self.setBackgroundBrush(theme.color("canvas"))
 
     def highlight_rect_in_viewport(self) -> QRect | None:
         """Where the highlight is drawn on screen (for tests)."""
@@ -260,18 +300,32 @@ class PdfView(QGraphicsView):
             return None
         return self.mapFromScene(self._hl_items[0].rect()).boundingRect()
 
-    def ensure_visible(self, page: int, bbox) -> None:
+    def ensure_visible(self, page: int, bbox, animate: bool = True) -> None:
         r = self.page_rect_scene(page, bbox)
         view = self.mapToScene(self.viewport().rect()).boundingRect()
         band_top = view.top() + view.height() * 0.12
         band_bottom = view.bottom() - view.height() * 0.18
         if r.top() < band_top or r.bottom() > band_bottom:
-            target_center = r.center().y() + view.height() * 0.15  # line ends up about a third down
-            self.centerOn(view.center().x(), target_center)
+            # glide so the line ends up about a third of the way down
+            target_center = r.center().y() + view.height() * 0.15
+            bar = self.verticalScrollBar()
+            target = bar.value() + int((target_center - view.center().y()) * self.zoom)
+            target = max(bar.minimum(), min(bar.maximum(), target))
+            self._scroll_anim.stop()
+            if animate and abs(target - bar.value()) < self.viewport().height() * 3:
+                self._scroll_anim.setStartValue(bar.value())
+                self._scroll_anim.setEndValue(target)
+                self._scroll_anim.start()
+            else:
+                bar.setValue(target)
         view = self.mapToScene(self.viewport().rect()).boundingRect()
         padded = r.adjusted(-4, 0, 4, 0)
-        if padded.left() < view.left() or padded.right() > view.right():
-            self.ensureVisible(padded, 24, 0)
+        hbar = self.horizontalScrollBar()
+        margin = 24 / self.zoom
+        if padded.left() < view.left() or padded.width() + 2 * margin > view.width():
+            hbar.setValue(hbar.value() - int((view.left() - padded.left() + margin) * self.zoom))
+        elif padded.right() > view.right():
+            hbar.setValue(hbar.value() + int((padded.right() - view.right() + margin) * self.zoom))
 
     # ---- edit overlays -------------------------------------------------------------------------------------------
     def set_overlays(self, items: list[tuple[int, tuple, QColor, QColor, str]]) -> None:

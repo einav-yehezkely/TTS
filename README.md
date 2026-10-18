@@ -27,6 +27,22 @@ Verified on: RTX 5050 Laptop GPU (Blackwell, compute capability 12.0, 8 GB), dri
 
 **Accuracy.** Line boundaries come from the model's own duration predictions, which are the durations the decoder uses to generate the audio. They are accurate to roughly one 25 ms frame. The on-screen change happens within about 0.1 s of the sound (30 ms UI poll plus the output-latency estimate). In testing, a line change was observed 115 ms after its data time, which matches the measured ~90 ms device latency. There is no word-level highlighting.
 
+## Interface
+
+* **Transcript panel** (`ui/transcript.py`): every narrated sentence in one `QTextDocument`, grouped by page.
+  * The current sentence and the line being heard inside it are marked with extra selections, so the 5,000-sentence book never re-lays-out while playing.
+  * It follows the reading with animated scrolling. Scrolling it by hand suspends following and shows "Back to current".
+  * Clicking any part of a sentence plays from that fragment's PDF line.
+  * Search is Ctrl+F. Ctrl+T collapses the panel to a rail with a slide animation.
+* **Player bar** (`ui/widgets.py`):
+  * The play button shows a spinner while speech is being prepared.
+  * A live caption shows the sentence, with the line being heard marked.
+  * A whole-document scrubber with page ticks shows a hover preview (page and text) and seeks on click or drag.
+  * It shows page, percent and time left. Time left uses the speaking rate measured from the synthesized audio.
+  * Voice and speed chips, and a sleep timer (minutes or end of page).
+* **Focus mode:** a dimming layer with a cut-out around the current line, in PDF coordinates, so it stays aligned at every zoom.
+* **Other:** smooth animated page-following, toast notifications, custom vector icons, and light/dark themes from one set of color tokens (`ui/theme.py`).
+
 ## GPU verification and fallback
 
 At startup the first inference runs with ONNX Runtime profiling enabled. The app counts per-node kernel time by provider and requires at least half of it to be on CUDA (measured: 89–94%). CPU fallback is disabled inside ORT (`disable_fallback`), so failures surface instead of silently running on the CPU. Then:
@@ -42,6 +58,7 @@ One real case this caught: cuDNN 9 loads its sub-libraries (for example `cudnn_e
 | `tests/unit_checks.py` | Known-answer layout tests (header, footer, page numbers, footnote, hyphenation, two columns, references). Scanned-PDF detection. Edits keep the mapping. Runtime GPU→CPU fallback. Cancellation. Runs with **network sockets blocked**. |
 | `tests/pipeline_check.py` | Real audio: play, pause, resume, next/previous, speed change, stop. Line-change timing compared against the model's timing. |
 | `tests/gui_check.py [pdf]` | Real window: click-to-read, ink-based highlight placement at 70/100/160/250% zoom and after resize, line-to-line movement, automatic page change, follow on/off, pause, edit mode, WAV and MP3 export. |
+| `tests/gui_ui_check.py [pdf]` | Transcript follows the sentence and line, click-to-read from a transcript line, Back to current, search, collapse/expand, focus mode (pixel brightness), scrubber seek, time left, sleep timer, theme switch. |
 | `tests/gui_fallback_check.py` | Whole app on CPU (simulated GPU failure), the explanation shown, position restored after reopening, OCR-required message. |
 | `tests/longdoc_check.py [pdf] [s]` | 244-page book from page 196: time to first audio, bounded prefetch, underruns, memory, stop. `KOKORO_FORCE_CPU=1` runs it on the CPU. |
 | `tests/download_check.py`, `tests/setup_dialog_check.py` | Resumable downloads and the first-run download dialog. |

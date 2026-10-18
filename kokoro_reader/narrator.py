@@ -58,6 +58,9 @@ class Narrator(QObject):
         self.current_line: int | None = None
         self._settings_dirty = False
         self.synth_times: list[tuple[int, float, float]] = []  # (segment, seconds to make, audio seconds)
+        self.chars_per_second = 14.5  # speaking rate at 1x, refined from real synthesized audio
+        self._rate_chars = 0.0
+        self._rate_secs = 0.0
         self._thread = threading.Thread(target=self._worker, name="narration-generator", daemon=True)
         self._thread.start()
         self._timer = QTimer(self)
@@ -280,6 +283,11 @@ class Narrator(QObject):
                     if epoch == self._epoch:
                         self._next += 1  # skip the segment rather than stall
                 continue
+            secs = len(synth.audio) / SAMPLE_RATE * speed
+            if secs > 0.5:
+                self._rate_chars += len(seg.text)
+                self._rate_secs += secs
+                self.chars_per_second = self._rate_chars / self._rate_secs
             with self._cv:
                 self._gen_busy = False
                 if epoch != self._epoch:

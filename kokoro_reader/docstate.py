@@ -48,6 +48,10 @@ class Settings:
     zoom: float = 0.0  # 0 = fit width
     cache_limit_mb: int = 2048
     prefer_gpu: bool = True
+    theme: str = "dark"
+    transcript_open: bool = True
+    transcript_width: int = 360
+    spotlight: bool = False
     last_dir: str = ""
     recent: list[str] = field(default_factory=list)
     options: Options = field(default_factory=Options)

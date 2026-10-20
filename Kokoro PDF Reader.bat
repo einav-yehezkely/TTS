@@ -4,7 +4,8 @@ setlocal
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -c "pass" >nul 2>&1 || goto setup
+    rem a library added in an update (for example PyAV for video export) also triggers setup, which installs it
+    ".venv\Scripts\python.exe" -c "import av" >nul 2>&1 || goto setup
     goto run
 )
 

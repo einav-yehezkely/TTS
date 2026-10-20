@@ -22,6 +22,8 @@ dependencies = [
     "sounddevice==0.5.6",
     "soundfile==0.14.0",
     "lameenc==1.9.0",
+    # Video export: PyAV wheels bundle FFmpeg with h264_nvenc, libx264 and the native AAC encoder
+    "av==19.0.1",
 ]
 
 [tool.uv]

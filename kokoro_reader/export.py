@@ -9,8 +9,19 @@ import numpy as np
 import soundfile as sf
 
 from .audiocache import AudioCache
-from .engine import SAMPLE_RATE, CancelToken, Cancelled, KokoroEngine
+from .engine import SAMPLE_RATE, CancelToken, Cancelled, KokoroEngine, Synth
 from .segments import Segment
+
+
+def segment_audio(engine: KokoroEngine, cache: AudioCache, seg: Segment, voice: str, speed: float,
+                  token: CancelToken | None = None) -> Synth:
+    """The segment's audio and line timing: from the cache if narrated before, otherwise synthesized and cached."""
+    key = AudioCache.key(voice, speed, seg.pause, seg.fragments)
+    synth = cache.get(key)
+    if synth is None:
+        synth = engine.synthesize(seg.fragments, voice, speed, seg.pause, token)
+        cache.put(key, synth)
+    return synth
 
 
 def export_audio(engine: KokoroEngine, cache: AudioCache, segments: list[Segment], out_path: str | Path,
@@ -39,11 +50,7 @@ def export_audio(engine: KokoroEngine, cache: AudioCache, segments: list[Segment
         for i, seg in enumerate(segments):
             if token and token.cancelled:
                 raise Cancelled()
-            key = AudioCache.key(voice, speed, seg.pause, seg.fragments)
-            synth = cache.get(key)
-            if synth is None:
-                synth = engine.synthesize(seg.fragments, voice, speed, seg.pause, token)
-                cache.put(key, synth)
+            synth = segment_audio(engine, cache, seg, voice, speed, token)
             pcm = (np.clip(synth.audio, -1.0, 1.0) * 32767).astype(np.int16)
             if wav is not None:
                 wav.write(pcm)

@@ -190,9 +190,14 @@ class OptionsDialog(QDialog):
 # ---- export -----------------------------------------------------------------------------------------------------
 
 class ExportDialog(QDialog):
-    def __init__(self, page_count: int, current_page: int, default_name: str, start_dir: str, parent=None):
+    FORMATS = [("wav", "WAV audio (uncompressed, large)", "WAV audio (*.wav)"),
+               ("mp3", "MP3 audio (128 kbps, small)", "MP3 audio (*.mp3)"),
+               ("mp4", "MP4 video – the pages with the line being read highlighted", "MP4 video (*.mp4)")]
+
+    def __init__(self, page_count: int, current_page: int, default_name: str, settings: Settings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export audio")
+        from ..video import QUALITIES, VIEWS  # here, so the first-run setup dialog does not load the speech engine
+        self.setWindowTitle("Export")
         self.page_count = page_count
         self.first = QSpinBox()
         self.first.setRange(1, page_count)
@@ -205,9 +210,12 @@ class ExportDialog(QDialog):
         self.scope.currentIndexChanged.connect(self._scope_changed)
         self.current_page = current_page
         self.fmt = QComboBox()
-        self.fmt.addItems(["WAV (uncompressed, large)", "MP3 (128 kbps, small)"])
+        for _, label, _ in self.FORMATS:
+            self.fmt.addItem(label)
+        self.fmt.setCurrentIndex(next((i for i, f in enumerate(self.FORMATS) if f[0] == settings.export_format), 0))
+        self.fmt.currentIndexChanged.connect(self._format_changed)
         self.default_name = default_name
-        self.start_dir = start_dir
+        self.start_dir = settings.last_dir or str(Path.home())
         form = QFormLayout()
         form.addRow("What to export:", self.scope)
         pr = QHBoxLayout()
@@ -218,6 +226,25 @@ class ExportDialog(QDialog):
         pr.addStretch(1)
         form.addRow(pr)
         form.addRow("Format:", self.fmt)
+
+        self.video_box = QGroupBox("Video")
+        self.view = QComboBox()
+        for key, label in VIEWS.items():
+            self.view.addItem(label, key)
+        self.view.setCurrentIndex(max(0, self.view.findData(settings.video_view)))
+        self.quality = QComboBox()
+        for key, label in QUALITIES.items():
+            self.quality.addItem(label, key)
+        self.quality.setCurrentIndex(max(0, self.quality.findData(settings.video_quality)))
+        vform = QFormLayout(self.video_box)
+        vform.addRow("View:", self.view)
+        vform.addRow("Quality:", self.quality)
+        vnote = QLabel("Zoomed views fit the text column to the screen width and follow the line being read, so "
+                       "the text stays readable on a phone. Encoding uses the NVIDIA graphics card when available, "
+                       "otherwise the processor.")
+        vnote.setWordWrap(True)
+        vform.addRow(vnote)
+
         note = QLabel("Export uses the current voice, speed and narration options. Parts already heard are reused "
                       "from the cache. You can keep reading while it runs.")
         note.setWordWrap(True)
@@ -227,10 +254,28 @@ class ExportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
         lay.addLayout(form)
+        lay.addWidget(self.video_box)
         lay.addWidget(note)
         lay.addWidget(buttons)
         self._scope_changed(0)
+        self._format_changed()
         self.path = ""
+
+    @property
+    def format(self) -> str:
+        return self.FORMATS[self.fmt.currentIndex()][0]
+
+    @property
+    def video_view(self) -> str:
+        return self.view.currentData()
+
+    @property
+    def video_quality(self) -> int:
+        return self.quality.currentData()
+
+    def _format_changed(self) -> None:
+        self.video_box.setVisible(self.format == "mp4")
+        self.adjustSize()
 
     def _scope_changed(self, idx: int) -> None:
         self.first.setEnabled(idx == 1)
@@ -247,12 +292,12 @@ class ExportDialog(QDialog):
         return range(a - 1, b)
 
     def _accept(self) -> None:
-        ext = ".mp3" if self.fmt.currentIndex() == 1 else ".wav"
+        fmt, _, file_filter = self.FORMATS[self.fmt.currentIndex()]
+        ext = "." + fmt
         pr = self.pages()
         suffix = "" if (pr.start == 0 and pr.stop == self.page_count) else f"_pages{pr.start + 1}-{pr.stop}"
         name = str(Path(self.start_dir) / f"{self.default_name}{suffix}{ext}")
-        path, _ = QFileDialog.getSaveFileName(self, "Save audio as", name,
-                                              "MP3 audio (*.mp3)" if ext == ".mp3" else "WAV audio (*.wav)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save as", name, file_filter)
         if not path:
             return
         if not path.lower().endswith(ext):

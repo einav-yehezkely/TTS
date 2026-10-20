@@ -69,6 +69,10 @@ class CancelToken:
     def cancelled(self) -> bool:
         return self._event.is_set()
 
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until cancelled (True) or the timeout passes (False)."""
+        return self._event.wait(timeout)
+
     def _add(self, ro: ort.RunOptions) -> None:
         with self._lock:
             if self._event.is_set():

@@ -53,6 +53,9 @@ class Settings:
     transcript_width: int = 360
     spotlight: bool = False
     last_dir: str = ""
+    export_format: str = "wav"           # wav / mp3 / mp4
+    video_view: str = "zoom_portrait"   # see video.VIEWS
+    video_quality: int = 1080
     recent: list[str] = field(default_factory=list)
     options: Options = field(default_factory=Options)
 

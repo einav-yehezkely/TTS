@@ -21,6 +21,7 @@ from ..layout import ROLE_LABELS, DocLayout, load_or_extract
 from ..narrator import Narrator
 from ..paths import CACHE_DIR, EXTRACT_CACHE_DIR, VOICES_DIR
 from ..segments import build_segments, line_included, page_blocks, page_order
+from ..video import ENCODER_LABELS, export_video
 from . import icons, theme
 from .dialogs import Bridge, ExportDialog, HelpDialog, OptionsDialog, info, open_folder
 from .transcript import Rail, SideSplitter, TranscriptPanel
@@ -124,7 +125,8 @@ class MainWindow(QMainWindow):
         self.act_focus.setChecked(self.settings.spotlight)
         self.act_edit = self._act("Reading order", "edit", None, self._toggle_edit, checkable=True,
                                   tip="Check and correct the reading order, or exclude parts of a page")
-        self.act_export = self._act("Export", "export", "Ctrl+E", self._export, tip="Save as WAV or MP3 (Ctrl+E)")
+        self.act_export = self._act("Export", "export", "Ctrl+E", self._export,
+                                    tip="Save as audio (WAV, MP3) or video (MP4) (Ctrl+E)")
         self.act_options = self._act("Narration options…", None, None, self._options)
         self.act_theme = self._act("Theme", "sun", "Ctrl+Shift+L", self._toggle_theme,
                                    tip="Switch between dark and light (Ctrl+Shift+L)")
@@ -1027,35 +1029,57 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export running", "An export is already running.")
             return
         current = self.view.visible_pages()[0] if self.view.visible_pages() else 0
-        dlg = ExportDialog(self.layout_.page_count, current, Path(self.state.path).stem,
-                           self.settings.last_dir or str(Path.home()), self)
+        dlg = ExportDialog(self.layout_.page_count, current, Path(self.state.path).stem, self.settings, self)
         if not dlg.exec():
             return
-        pages = dlg.pages()
+        self.settings.export_format = dlg.format
+        if dlg.format == "mp4":
+            self.settings.video_view, self.settings.video_quality = dlg.video_view, dlg.video_quality
+        self.settings.save()
+        self.start_export(dlg.pages(), dlg.path, dlg.video_view, dlg.video_quality)
+
+    def start_export(self, pages: range, path: str, video_view: str = "zoom_portrait",
+                     video_quality: int = 1080) -> None:
+        """Export the pages to path (.wav, .mp3 or .mp4) on a worker thread, with a progress window."""
         segs = build_segments(self.layout_, self.state, self.settings.options, pages)
         if not segs:
             QMessageBox.information(self, "Nothing to export", "There is no narrated text on those pages.")
             return
-        voice, speed, path = self.narrator.voice, self.narrator.speed, dlg.path
+        video = path.lower().endswith(".mp4")
+        voice, speed, layout = self.narrator.voice, self.narrator.speed, self.layout_
         token = CancelToken()
         self._export_token = token
         progress = QProgressDialog(f"Exporting {len(segs)} sentences to {Path(path).name}…", "Cancel", 0, len(segs),
                                    self)
-        progress.setWindowTitle("Exporting audio")
+        progress.setWindowTitle("Exporting video" if video else "Exporting audio")
         progress.setWindowModality(Qt.WindowModality.NonModal)
         progress.setMinimumDuration(0)
+        progress.setMinimumWidth(460)
         progress.canceled.connect(token.cancel)
+        self._export_progress = progress
         bridge = Bridge()
-        bridge.progress.connect(lambda d, t, _: progress.setValue(d))
+
+        def on_progress(d, t, text):
+            progress.setMaximum(t)
+            progress.setValue(d)
+            if text:
+                progress.setLabelText(text)
+        bridge.progress.connect(on_progress)
         started = time.perf_counter()
 
-        def done(seconds):
+        def done(result):
             progress.close()
             self._export_token = None
+            seconds = result.duration if video else result
             m, s = divmod(int(seconds), 60)
-            box = QMessageBox(QMessageBox.Icon.Information, "Export finished",
-                              f"Saved {m} min {s} s of audio to:\n{path}\n\n"
-                              f"(took {time.perf_counter() - started:.0f} s)", QMessageBox.StandardButton.Ok, self)
+            what = "video" if video else "audio"
+            text = f"Saved {m} min {s} s of {what} to:\n{path}\n\n(took {time.perf_counter() - started:.0f} s)"
+            if video:
+                text += f"\n\nEncoded with the {ENCODER_LABELS.get(result.encoder, result.encoder)}."
+                if result.fallback_reason:
+                    text += f"\n{result.fallback_reason}"
+            box = QMessageBox(QMessageBox.Icon.Information, "Export finished", text, QMessageBox.StandardButton.Ok,
+                              self)
             folder = box.addButton("Show in folder", QMessageBox.ButtonRole.ActionRole)
             box.exec()
             if box.clickedButton() is folder:
@@ -1074,9 +1098,13 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
-                secs = export_audio(self.engine, self.cache, segs, path, voice, speed,
-                                    lambda d, t: bridge.progress.emit(d, t, ""), token)
-                bridge.done.emit(secs)
+                if video:
+                    result = export_video(self.engine, self.cache, layout, segs, path, voice, speed, video_view,
+                                          video_quality, bridge.progress.emit, token)
+                else:
+                    result = export_audio(self.engine, self.cache, segs, path, voice, speed,
+                                          lambda d, t: bridge.progress.emit(d, t, ""), token)
+                bridge.done.emit(result)
             except Cancelled:
                 bridge.failed.emit("cancelled")
             except Exception as e:  # noqa: BLE001
